@@ -42,6 +42,9 @@ from log_utils import (
     setup_logging,
 )
 
+EMNIST_MEAN = 0.1722
+EMNIST_STD = 0.3309
+
 
 # ---------- 配置 ----------
 @dataclass
@@ -60,6 +63,11 @@ class Config:
     widen_factor: int = 2
     seed: int = 42
     log_every: int = 100          # 每 N 个 step 输出一行进度日志（0 = 关闭）
+    tta: bool = True
+    tta_views: int = 8
+    tta_rot_deg: float = 7.0
+    tta_translate: float = 0.08
+    tta_scale: float = 0.04
     checkpoint_dir: str = "checkpoints"
     log_dir: str = "logs"
 
@@ -72,7 +80,11 @@ class Config:
                 continue
             current = getattr(config, f.name)
             try:
-                setattr(config, f.name, type(current)(raw))
+                if isinstance(current, bool):
+                    value = raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+                else:
+                    value = type(current)(raw)
+                setattr(config, f.name, value)
             except (TypeError, ValueError):
                 pass
         config.log_dir = os.getenv("LOG_DIR", config.log_dir)
@@ -93,6 +105,8 @@ class Config:
             ("widen_factor", str(self.widen_factor)),
             ("seed", str(self.seed)),
             ("log_every", f"{self.log_every} steps"),
+            ("tta", f"{'开启' if self.tta else '关闭'} · {self.tta_views} 视图"),
+            ("tta 几何", f"rot ±{self.tta_rot_deg}°, trans ±{self.tta_translate}, scale ±{self.tta_scale}"),
         ]
 
 
@@ -144,7 +158,7 @@ def collect_env(device: torch.device) -> list[tuple[str, str]]:
 def build_loaders(config: Config, log: LogManager):
     """构建训练 / 验证 / 测试 DataLoader（EMNIST Digits）。"""
     # EMNIST Digits 的近似统计量
-    mean, std = 0.1722, 0.3309
+    mean, std = EMNIST_MEAN, EMNIST_STD
 
     train_tf = transforms.Compose([
         transforms.RandomAffine(degrees=5, translate=(0.05, 0.05)),
@@ -454,13 +468,88 @@ def predict(model, loader, device):
     return torch.cat(preds), torch.cat(targets)
 
 
-def log_test_results(model, best_val, test_loader, device, log: LogManager) -> dict:
+def _affine_view_raw(x_raw, angle=0.0, dx=0.0, dy=0.0, scale=1.0):
+    """对 [0, 1] 图像 batch 施加旋转、平移和缩放。"""
+    angle_rad = torch.as_tensor(angle * torch.pi / 180.0, device=x_raw.device, dtype=x_raw.dtype)
+    cos_angle = torch.cos(angle_rad) / scale
+    sin_angle = torch.sin(angle_rad) / scale
+    theta = torch.zeros((x_raw.size(0), 2, 3), device=x_raw.device, dtype=x_raw.dtype)
+    theta[:, 0, 0] = cos_angle
+    theta[:, 0, 1] = sin_angle
+    theta[:, 0, 2] = dx
+    theta[:, 1, 0] = -sin_angle
+    theta[:, 1, 1] = cos_angle
+    theta[:, 1, 2] = dy
+    grid = F.affine_grid(theta, x_raw.size(), align_corners=False)
+    return F.grid_sample(x_raw, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
+
+
+def make_tta_views(x_norm, config: Config):
+    """返回归一化后的原图及多个不改变语义的几何视图。"""
+    if not config.tta or config.tta_views <= 1:
+        return [x_norm]
+
+    x_raw = (x_norm * EMNIST_STD + EMNIST_MEAN).clamp(0.0, 1.0)
+    rot = config.tta_rot_deg
+    translate = config.tta_translate
+    scale = config.tta_scale
+    transforms_to_apply = [
+        (rot, 0.0, 0.0, 1.0),
+        (-rot, 0.0, 0.0, 1.0),
+        (0.0, translate, 0.0, 1.0),
+        (0.0, -translate, 0.0, 1.0),
+        (0.0, 0.0, translate, 1.0),
+        (0.0, 0.0, -translate, 1.0),
+        (0.0, 0.0, 0.0, 1.0 + scale),
+        (0.0, 0.0, 0.0, 1.0 - scale),
+        (rot, translate, 0.0, 1.0),
+        (-rot, -translate, 0.0, 1.0),
+        (rot, 0.0, translate, 1.0),
+        (-rot, 0.0, -translate, 1.0),
+    ]
+    views = [x_norm]
+    for angle, dx, dy, view_scale in transforms_to_apply[:config.tta_views - 1]:
+        view = _affine_view_raw(x_raw, angle, dx, dy, view_scale)
+        views.append((view - EMNIST_MEAN) / EMNIST_STD)
+    return views
+
+
+@torch.no_grad()
+def predict_tta(model, loader, device, config: Config):
+    """对测试集的多个视图平均 softmax 概率后预测。"""
+    model.eval()
+    use_amp = (device.type == 'cuda')
+    preds, targets = [], []
+    for x, y in loader:
+        x = x.to(device, non_blocking=True)
+        probabilities = []
+        for view in make_tta_views(x, config):
+            with torch.amp.autocast('cuda', enabled=use_amp):
+                out = model(view)
+            probabilities.append(F.softmax(out.float(), dim=1))
+        preds.append(torch.stack(probabilities).mean(dim=0).argmax(1).cpu())
+        targets.append(y)
+    return torch.cat(preds), torch.cat(targets)
+
+
+def log_test_results(model, best_val, test_loader, device, log: LogManager,
+                     config: Config | None = None) -> dict:
     """测试集评估：验证/测试表现对比、各类别准确率、混淆矩阵。"""
     log.section("测试集评估")
+    use_tta = config is not None and config.tta and config.tta_views > 1
 
+    if use_tta:
+        log.info(
+            f"测试集启用 TTA：共 {config.tta_views} 个视图（原图 + {config.tta_views - 1} 个几何变换） · "
+            f"rot ±{config.tta_rot_deg}° · trans ±{config.tta_translate} · scale ±{config.tta_scale}"
+        )
     with log.progress() as progress:
-        task = log.add_task(progress, "测试集推理", total=len(test_loader), stats="")
-        preds, targets = predict(model, test_loader, device)
+        task = log.add_task(progress, "测试集 TTA 推理" if use_tta else "测试集推理",
+                            total=len(test_loader), stats="")
+        if use_tta:
+            preds, targets = predict_tta(model, test_loader, device, config)
+        else:
+            preds, targets = predict(model, test_loader, device)
         progress.update(task, advance=len(test_loader), stats=f"样本 {len(targets)}")
 
     test_acc = (preds == targets).float().mean().item()
@@ -470,7 +559,8 @@ def log_test_results(model, best_val, test_loader, device, log: LogManager) -> d
         ["数据集", ("准确率", "right")],
         [
             ["验证集（最优）", fmt_pct(best_val)],
-            ["测试集", f"[metric]{fmt_pct(test_acc)}[/]"],
+            [f"测试集（TTA {config.tta_views} 视图）" if use_tta else "测试集",
+             f"[metric]{fmt_pct(test_acc)}[/]"],
         ],
         caption="验证集用于选最优权重，测试集仅做最终评估。",
         zebra=True,
@@ -583,7 +673,7 @@ def main() -> int:
     log.debug(f"已保存 {ckpt_path} · {fmt_bytes(os.path.getsize(ckpt_path))}")
     log.success(f"模型权重已保存至 [accent]{ckpt_path}[/]")
 
-    results = log_test_results(model, best_val, test_loader, device, log)
+    results = log_test_results(model, best_val, test_loader, device, log, config)
 
     best_record = max(history, key=lambda record: record['val_acc'])
     log.section("运行汇总")
