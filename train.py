@@ -469,17 +469,22 @@ def predict(model, loader, device):
 
 
 def _affine_view_raw(x_raw, angle=0.0, dx=0.0, dy=0.0, scale=1.0):
-    """对 [0, 1] 图像 batch 施加旋转、平移和缩放。"""
+    """对 [0, 1] 图像 batch 施加旋转、平移和缩放。
+
+    dx/dy 使用整图比例，与 transforms.RandomAffine 的 translate 语义一致；
+    affine_grid 的归一化坐标以半宽/半高为 1，因此传入 theta 前要乘 2。
+    """
     angle_rad = torch.as_tensor(angle * torch.pi / 180.0, device=x_raw.device, dtype=x_raw.dtype)
     cos_angle = torch.cos(angle_rad) / scale
     sin_angle = torch.sin(angle_rad) / scale
     theta = torch.zeros((x_raw.size(0), 2, 3), device=x_raw.device, dtype=x_raw.dtype)
+    # affine_grid 使用输出到输入的逆映射，因此正角度的视觉旋转方向相反。
     theta[:, 0, 0] = cos_angle
     theta[:, 0, 1] = sin_angle
-    theta[:, 0, 2] = dx
+    theta[:, 0, 2] = 2.0 * dx
     theta[:, 1, 0] = -sin_angle
     theta[:, 1, 1] = cos_angle
-    theta[:, 1, 2] = dy
+    theta[:, 1, 2] = 2.0 * dy
     grid = F.affine_grid(theta, x_raw.size(), align_corners=False)
     return F.grid_sample(x_raw, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
 
