@@ -710,7 +710,7 @@ def main() -> int:
     os.makedirs(config.checkpoint_dir, exist_ok=True)
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     ckpt_path = os.path.join(config.checkpoint_dir, f"wrn_mnist_{timestamp}.pt")
-    torch.save(model.state_dict(), ckpt_path)
+    torch.save(model, ckpt_path)
     log.debug(f"已保存 {ckpt_path} · {fmt_bytes(os.path.getsize(ckpt_path))}")
     log.success(f"模型权重已保存至 [accent]{ckpt_path}[/]")
 
