@@ -21,6 +21,7 @@ wandb/
 *.npy
 *.npz
 *.h5
+*.csv
 
 # 日志兜底
 *.log
