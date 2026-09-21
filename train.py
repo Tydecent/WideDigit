@@ -23,6 +23,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from PIL import Image
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
@@ -43,8 +44,93 @@ from log_utils import (
     setup_logging,
 )
 
+# 旧常量保留为「未登记 / 旧 ckpt」的回退值
 EMNIST_MEAN = 0.1722
 EMNIST_STD = 0.3309
+
+# torchvision 的 MNIST / EMNIST 数据集类都 **不提供** mean / std 属性或任何内置
+# 归一化参数 —— 它们只负责下载、解压、返回 PIL.Image / tensor，归一化必须由使用者
+# 通过 transforms.Normalize 显式完成。因此这里维护一张硬编码查找表。
+DATASET_NORM: dict[str, tuple[float, float]] = {
+    "mnist":           (0.1307, 0.3081),   # 社区广泛采用的标准值
+    "emnist_mnist":    (0.1722, 0.3309),
+    "emnist_digits":   (0.1722, 0.3309),   # 注意：这组值是 EMNIST Digits 的统计量
+    "emnist_letters":  (0.1722, 0.3309),
+    "emnist_balanced": (0.1722, 0.3309),
+    "emnist_byclass":  (0.1722, 0.3309),
+}
+
+
+def dataset_norm(name: str) -> tuple[float, float]:
+    """返回数据集对应的 (mean, std)；未注册的数据集直接报错。"""
+    if name not in DATASET_NORM:
+        raise ValueError(f"未注册的数据集：{name}")
+    return DATASET_NORM[name]
+
+
+# EMNIST 官方规范（NIST）规定其 idx 图像文件按 **转置** 方式存储，而
+# ``torchvision.datasets.EMNIST`` 直接复用 ``MNIST`` 的加载逻辑，未做还原 ——
+# 因此它返回的图像是「侧躺」的。这里对所有 EMNIST split 标记为需要转置。
+DATASET_TRANSPOSE: dict[str, bool] = {
+    "mnist":           False,
+    "emnist_mnist":    True,
+    "emnist_digits":   True,
+    "emnist_letters":  True,
+    "emnist_balanced": True,
+    "emnist_byclass":  True,
+}
+
+
+def dataset_transpose(name: str) -> bool:
+    """返回该数据集加载后是否需要转置还原；未注册的数据集直接报错。"""
+    if name not in DATASET_TRANSPOSE:
+        raise ValueError(f"未注册的数据集：{name}")
+    return DATASET_TRANSPOSE[name]
+
+
+def _maybe_transpose(tf_list: list, transpose: bool) -> list:
+    """需还原朝向时，在 transform 链最前面插入 PIL 转置。
+
+    必须是 ``PIL.Image.transpose``（不是 ``rotate(90)`` / ``rot90``）——它就是
+    EMNIST 存储时所用变换的逆变换。转置只能作用于 PIL 图像，所以必须放在
+    ``ToTensor`` **之前**。
+    """
+    if not transpose:
+        return tf_list
+    return [transforms.Lambda(lambda img: img.transpose(Image.TRANSPOSE))] + tf_list
+
+
+def model_expects_transposed(trained_on: str | None,
+                             trained_transpose: bool | None) -> bool | None:
+    """模型期望的输入是否处于「转置（侧躺）」状态；``None`` 表示无法判断。
+
+    一次训练后模型学到的朝向 = ``训练数据原生朝向 XOR 训练时是否施加过 transpose``：
+
+    * 修复后的 train.py：EMNIST 源（原生转置）已在训练时还原成正向，
+      于是模型期望 **正向** 输入；
+    * 旧 ckpt（``trained_transpose is None``）：无从判断，调用方应保持既有行为。
+    """
+    if trained_transpose is None:
+        return None
+    train_native = DATASET_TRANSPOSE.get(trained_on or "", False)
+    return bool(train_native) ^ bool(trained_transpose)
+
+
+def needs_transpose(target: str, trained_on: str | None,
+                    trained_transpose: bool | None) -> bool:
+    """读取 ``target`` 数据集时是否要施加 transpose，才能与模型期望的朝向对齐。
+
+    判定依据是「把目标数据的原生朝向对齐到模型期望的朝向」，因此结果既取决于
+    数据源，也取决于模型的训练方式 —— 两者都由 ckpt 携带的信息推导得出：
+
+    * 新 EMNIST ckpt（期望正向）→ EMNIST 源需转置、MNIST 源不转置；
+    * 新 MNIST ckpt（期望正向）→ 同上；
+    * 旧 ckpt（未记录标记）→ 返回 ``False``，完全保持修复前的行为。
+    """
+    expects = model_expects_transposed(trained_on, trained_transpose)
+    if expects is None:
+        return False
+    return dataset_transpose(target) != expects
 
 
 # ---------- 配置 ----------
@@ -65,6 +151,7 @@ class Config:
     grad_clip: float = 5.0
     widen_factor: int = 2
     num_classes: int = 10
+    dataset: str = "emnist_digits"  # 可选：mnist / emnist_digits（见 DATASET_NORM）
     aug_degrees: float = 5.0
     aug_translate: float = 0.05
     seed: int = 42
@@ -96,6 +183,16 @@ class Config:
         config.log_dir = os.getenv("LOG_DIR", config.log_dir)
         return config
 
+    def norm(self) -> tuple[float, float]:
+        """当前 ``dataset`` 对应的训练 / 评估归一化 (mean, std)。"""
+        return dataset_norm(self.dataset)
+
+    def orientation_desc(self) -> str:
+        """图像朝向的可读描述（与实际 transform 保持同源）。"""
+        if dataset_transpose(self.dataset):
+            return "已转置还原（EMNIST 规范）"
+        return "原样（MNIST）"
+
     def augmentation_desc(self) -> str:
         """训练集数据增强的可读描述（与实际构建的 transform 保持同源）。"""
         return f"RandomAffine(±{self.aug_degrees:g}°, 平移 {self.aug_translate:.0%})"
@@ -114,6 +211,9 @@ class Config:
             ("grad_clip", f"{self.grad_clip:.1f}"),
             ("widen_factor", str(self.widen_factor)),
             ("num_classes", str(self.num_classes)),
+            ("dataset", self.dataset),
+            ("归一化", f"mean={self.norm()[0]:.4f}, std={self.norm()[1]:.4f}"),
+            ("图像朝向", self.orientation_desc()),
             ("seed", str(self.seed)),
             ("log_every", f"{self.log_every} steps"),
             ("训练增强", self.augmentation_desc()),
@@ -168,31 +268,42 @@ def collect_env(device: torch.device) -> list[tuple[str, str]]:
 
 # ---------- 数据 ----------
 def build_loaders(config: Config, log: LogManager):
-    """构建训练 / 验证 / 测试 DataLoader（EMNIST Digits）。"""
-    mean, std = EMNIST_MEAN, EMNIST_STD
+    """构建训练 / 验证 / 测试 DataLoader（数据集与预处理由 ``config.dataset`` 决定）。"""
+    mean, std = dataset_norm(config.dataset)
+    transpose = dataset_transpose(config.dataset)
 
-    train_tf = transforms.Compose([
+    train_tf = transforms.Compose(_maybe_transpose([
         transforms.RandomAffine(degrees=config.aug_degrees,
                                 translate=(config.aug_translate, config.aug_translate)),
         transforms.ToTensor(),
         transforms.Normalize((mean,), (std,)),
-    ])
-    eval_tf = transforms.Compose([
+    ], transpose))
+    eval_tf = transforms.Compose(_maybe_transpose([
         transforms.ToTensor(),
         transforms.Normalize((mean,), (std,)),
-    ])
+    ], transpose))
 
-    log.info("正在载入 / 下载 EMNIST Digits 数据集 …")
+    log.info(
+        f"正在载入 / 下载 [accent]{config.dataset}[/] 数据集 · "
+        f"归一化 mean={mean:.4f}, std={std:.4f} · "
+        f"图像朝向 {'转置还原' if transpose else '原样'} …"
+    )
     started = time.perf_counter()
-    train_full = datasets.EMNIST('./data', split='digits', train=True,
-                                 download=True, transform=train_tf)
-    val_full   = datasets.EMNIST('./data', split='digits', train=True,
-                                 download=True, transform=eval_tf)
-    test_set   = datasets.EMNIST('./data', split='digits', train=False,
-                                 download=True, transform=eval_tf)
+    if config.dataset == "mnist":
+        train_full = datasets.MNIST('./data', train=True,  download=True, transform=train_tf)
+        val_full   = datasets.MNIST('./data', train=True,  download=True, transform=eval_tf)
+        test_set   = datasets.MNIST('./data', train=False, download=True, transform=eval_tf)
+        cache_dir = './data/MNIST'
+    elif config.dataset == "emnist_digits":
+        train_full = datasets.EMNIST('./data', split="digits", train=True,  download=True, transform=train_tf)
+        val_full   = datasets.EMNIST('./data', split="digits", train=True,  download=True, transform=eval_tf)
+        test_set   = datasets.EMNIST('./data', split="digits", train=False, download=True, transform=eval_tf)
+        cache_dir = './data/EMNIST'
+    else:
+        raise ValueError(f"不支持的 dataset：{config.dataset}")
     log.info(
         f"数据集就绪 · 耗时 [accent]{fmt_duration(time.perf_counter() - started)}[/] · "
-        f"缓存目录 [accent]./data/EMNIST[/]"
+        f"缓存目录 [accent]{cache_dir}[/]"
     )
 
     val_size = min(config.val_size, len(train_full) - 1)
@@ -229,10 +340,12 @@ def build_loaders(config: Config, log: LogManager):
 
 def log_dataset(log: LogManager, config: Config, stats: dict) -> None:
     """输出数据划分与 DataLoader 配置。"""
+    mean, std = dataset_norm(config.dataset)
+    transpose = dataset_transpose(config.dataset)
     loader = stats["loader"]
     log.section("数据集")
     log.table(
-        "EMNIST Digits 数据划分",
+        f"{config.dataset} 数据划分",
         ["划分", ("样本数", "right"), ("批大小", "right"), "数据增强", "用途"],
         [
             ["训练集", fmt_count(stats['train_size']), config.batch_size, config.augmentation_desc(), "参数更新"],
@@ -240,7 +353,8 @@ def log_dataset(log: LogManager, config: Config, stats: dict) -> None:
             ["测试集", fmt_count(stats['test_size']), config.eval_batch_size, "无", "最终评估"],
         ],
         caption=(f"划分方式：固定随机置换（seed={config.seed}）· "
-                 f"归一化 mean={EMNIST_MEAN:.4f}, std={EMNIST_STD:.4f}"),
+                 f"归一化 dataset={config.dataset} · mean={mean:.4f}, std={std:.4f} · "
+                 f"图像朝向 {'已转置还原（EMNIST 规范）' if transpose else '原样（MNIST）'}"),
     )
     log.kv(
         "DataLoader 设置",
@@ -512,12 +626,19 @@ def _affine_view_raw(x_raw, angle=0.0, dx=0.0, dy=0.0, scale=1.0):
     return F.grid_sample(x_raw, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
 
 
-def make_tta_views(x_norm, config: Config):
-    """返回归一化后的原图及多个不改变语义的几何视图。"""
+def make_tta_views(x_norm, config: Config, mean: float | None = None, std: float | None = None):
+    """返回归一化后的原图及多个不改变语义的几何视图。
+
+    ``mean`` / ``std`` 必须与 ``x_norm`` 使用的归一化一致：TTA 会先反归一化回
+    [0, 1] 再做几何变换，最后按同一组参数重新归一化。缺省时回退到
+    ``config.dataset`` 注册的统计量，保持对旧调用方（如 predict.py）的兼容。
+    """
+    if mean is None or std is None:
+        mean, std = dataset_norm(config.dataset)
     if not config.tta or config.tta_views <= 1:
         return [x_norm]
 
-    x_raw = (x_norm * EMNIST_STD + EMNIST_MEAN).clamp(0.0, 1.0)
+    x_raw = (x_norm * std + mean).clamp(0.0, 1.0)
     rot = config.tta_rot_deg
     translate = config.tta_translate
     scale = config.tta_scale
@@ -538,20 +659,24 @@ def make_tta_views(x_norm, config: Config):
     views = [x_norm]
     for angle, dx, dy, view_scale in transforms_to_apply[:config.tta_views - 1]:
         view = _affine_view_raw(x_raw, angle, dx, dy, view_scale)
-        views.append((view - EMNIST_MEAN) / EMNIST_STD)
+        views.append((view - mean) / std)
     return views
 
 
 @torch.no_grad()
-def predict_tta(model, loader, device, config: Config):
-    """对测试集的多个视图平均 softmax 概率后预测。"""
+def predict_tta(model, loader, device, config: Config,
+                mean: float | None = None, std: float | None = None):
+    """对测试集的多个视图平均 softmax 概率后预测。
+
+    ``mean`` / ``std`` 为本次评估所用归一化，必须与 loader 的 transform 一致。
+    """
     model.eval()
     use_amp = (device.type == 'cuda')
     preds, targets = [], []
     for x, y in loader:
         x = x.to(device, non_blocking=True)
         probabilities = []
-        for view in make_tta_views(x, config):
+        for view in make_tta_views(x, config, mean, std):
             with torch.amp.autocast('cuda', enabled=use_amp):
                 out = model(view)
             probabilities.append(F.softmax(out.float(), dim=1))
@@ -561,8 +686,12 @@ def predict_tta(model, loader, device, config: Config):
 
 
 def log_test_results(model, best_val, test_loader, device, log: LogManager,
-                     config: Config | None = None) -> dict:
-    """测试集评估：验证/测试表现对比、各类别准确率、混淆矩阵。"""
+                     config: Config | None = None,
+                     mean: float | None = None, std: float | None = None) -> dict:
+    """测试集评估：验证/测试表现对比、各类别准确率、混淆矩阵。
+
+    ``mean`` / ``std`` 需与构建 ``test_loader`` 时一致（TTA 反归一化要用）。
+    """
     log.section("测试集评估")
     use_tta = config is not None and config.tta and config.tta_views > 1
 
@@ -575,7 +704,7 @@ def log_test_results(model, best_val, test_loader, device, log: LogManager,
         task = log.add_task(progress, "测试集 TTA 推理" if use_tta else "测试集推理",
                             total=len(test_loader), stats="")
         if use_tta:
-            preds, targets = predict_tta(model, test_loader, device, config)
+            preds, targets = predict_tta(model, test_loader, device, config, mean, std)
         else:
             preds, targets = predict(model, test_loader, device)
         progress.update(task, advance=len(test_loader), stats=f"样本 {len(targets)}")
@@ -654,7 +783,7 @@ def main() -> int:
 
     log.banner(
         "MNIST 手写数字识别",
-        f"WideResNet-28(widen={config.widen_factor}) · 单模型训练 · rich 日志",
+        f"WideResNet-28(widen={config.widen_factor}) · {config.dataset} · 单模型训练 · rich 日志",
     )
     log.info(f"详细日志文件：[accent]{log.log_path}[/]")
     log.info(
@@ -663,6 +792,15 @@ def main() -> int:
         "[accent]MNIST_EPOCHS=2 MNIST_VAL_SIZE=512[/] 可先跑一次冒烟测试。"
     )
     log.blank()
+
+    # 提前校验 dataset，避免跑到一半才报错
+    try:
+        mean, std = dataset_norm(config.dataset)
+        transpose = dataset_transpose(config.dataset)
+    except ValueError as exc:
+        log.error(f"{exc}（可选：{', '.join(DATASET_NORM)}）")
+        log.close()
+        return 2
 
     set_seed(config.seed)
     device = get_device(log)
@@ -710,11 +848,25 @@ def main() -> int:
     os.makedirs(config.checkpoint_dir, exist_ok=True)
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     ckpt_path = os.path.join(config.checkpoint_dir, f"wrn_mnist_{timestamp}.pt")
-    torch.save(model, ckpt_path)
+    # ckpt 自带训练时的归一化与朝向信息，test.py / predict.py 直接读取，
+    # 避免跳数据集评估或推理真实图片时输入分布 / 朝向错位。
+    torch.save({
+        "model": model,               # 保持 torch.save(model, ...) 的完整模型对象
+        "dataset": config.dataset,
+        "mean": mean,
+        "std": std,
+        "transpose": transpose,       # 模型期望的输入朝向（EMNIST 需转置还原）
+        "widen_factor": config.widen_factor,
+        "num_classes": config.num_classes,
+    }, ckpt_path)
     log.debug(f"已保存 {ckpt_path} · {fmt_bytes(os.path.getsize(ckpt_path))}")
     log.success(f"模型权重已保存至 [accent]{ckpt_path}[/]")
+    log.info(
+        f"ckpt 已记录预处理：dataset={config.dataset} · "
+        f"mean={mean:.4f} · std={std:.4f} · transpose={transpose}"
+    )
 
-    results = log_test_results(model, best_val, test_loader, device, log, config)
+    results = log_test_results(model, best_val, test_loader, device, log, config, mean, std)
 
     best_record = max(history, key=lambda record: record['val_acc'])
     log.section("运行汇总")
