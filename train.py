@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import datetime
 import os
 import platform
 import random
@@ -54,6 +55,8 @@ class Config:
     batch_size: int = 128
     eval_batch_size: int = 256
     num_workers: int = 4
+    pin_memory: bool = True
+    persistent_workers: bool = True
     val_size: int = 5000
     epochs: int = 30
     lr: float = 1e-3
@@ -61,6 +64,9 @@ class Config:
     label_smoothing: float = 0.05
     grad_clip: float = 5.0
     widen_factor: int = 2
+    num_classes: int = 10
+    aug_degrees: float = 5.0
+    aug_translate: float = 0.05
     seed: int = 42
     log_every: int = 100          # 每 N 个 step 输出一行进度日志（0 = 关闭）
     tta: bool = True
@@ -90,6 +96,10 @@ class Config:
         config.log_dir = os.getenv("LOG_DIR", config.log_dir)
         return config
 
+    def augmentation_desc(self) -> str:
+        """训练集数据增强的可读描述（与实际构建的 transform 保持同源）。"""
+        return f"RandomAffine(±{self.aug_degrees:g}°, 平移 {self.aug_translate:.0%})"
+
     def rows(self) -> list[tuple[str, str]]:
         """转成日志面板用的键值对。"""
         return [
@@ -103,8 +113,10 @@ class Config:
             ("label_smoothing", f"{self.label_smoothing:.4f}"),
             ("grad_clip", f"{self.grad_clip:.1f}"),
             ("widen_factor", str(self.widen_factor)),
+            ("num_classes", str(self.num_classes)),
             ("seed", str(self.seed)),
             ("log_every", f"{self.log_every} steps"),
+            ("训练增强", self.augmentation_desc()),
             ("tta", f"{'开启' if self.tta else '关闭'} · {self.tta_views} 视图"),
             ("tta 几何", f"rot ±{self.tta_rot_deg}°, trans ±{self.tta_translate}, scale ±{self.tta_scale}"),
         ]
@@ -157,11 +169,11 @@ def collect_env(device: torch.device) -> list[tuple[str, str]]:
 # ---------- 数据 ----------
 def build_loaders(config: Config, log: LogManager):
     """构建训练 / 验证 / 测试 DataLoader（EMNIST Digits）。"""
-    # EMNIST Digits 的近似统计量
     mean, std = EMNIST_MEAN, EMNIST_STD
 
     train_tf = transforms.Compose([
-        transforms.RandomAffine(degrees=5, translate=(0.05, 0.05)),
+        transforms.RandomAffine(degrees=config.aug_degrees,
+                                translate=(config.aug_translate, config.aug_translate)),
         transforms.ToTensor(),
         transforms.Normalize((mean,), (std,)),
     ])
@@ -190,43 +202,53 @@ def build_loaders(config: Config, log: LogManager):
     train_set = Subset(train_full, perm[:train_size])
     val_set   = Subset(val_full,   perm[train_size:])
 
-    common = dict(num_workers=config.num_workers, pin_memory=True,
-                  persistent_workers=(config.num_workers > 0))
+    common = dict(num_workers=config.num_workers, pin_memory=config.pin_memory,
+                  persistent_workers=(config.persistent_workers and config.num_workers > 0))
     train_loader = DataLoader(train_set, batch_size=config.batch_size,
                               shuffle=True, drop_last=True, **common)
     val_loader   = DataLoader(val_set,   batch_size=config.eval_batch_size,
-                              shuffle=False, **common)
+                              shuffle=False, drop_last=False, **common)
     test_loader  = DataLoader(test_set,  batch_size=config.eval_batch_size,
-                              shuffle=False, **common)
+                              shuffle=False, drop_last=False, **common)
 
     stats = {
         "train_size": train_size,
         "val_size": val_size,
         "test_size": len(test_set),
         "steps_per_epoch": len(train_loader),
+        # 记录真正传给 DataLoader 的参数，避免日志与实际行为脱节
+        "loader": {
+            "num_workers": common["num_workers"],
+            "pin_memory": common["pin_memory"],
+            "persistent_workers": common["persistent_workers"],
+            "drop_last": (train_loader.drop_last, val_loader.drop_last),
+        },
     }
     return train_loader, val_loader, test_loader, stats
 
 
 def log_dataset(log: LogManager, config: Config, stats: dict) -> None:
     """输出数据划分与 DataLoader 配置。"""
+    loader = stats["loader"]
     log.section("数据集")
     log.table(
         "EMNIST Digits 数据划分",
         ["划分", ("样本数", "right"), ("批大小", "right"), "数据增强", "用途"],
         [
-            ["训练集", fmt_count(stats['train_size']), config.batch_size, "RandomAffine(±5°, 平移 5%)", "参数更新"],
+            ["训练集", fmt_count(stats['train_size']), config.batch_size, config.augmentation_desc(), "参数更新"],
             ["验证集", fmt_count(stats['val_size']), config.eval_batch_size, "无", "选最优模型"],
             ["测试集", fmt_count(stats['test_size']), config.eval_batch_size, "无", "最终评估"],
         ],
-        caption=f"划分方式：固定随机置换（seed={config.seed}）· 归一化 mean=0.1722, std=0.3309",
+        caption=(f"划分方式：固定随机置换（seed={config.seed}）· "
+                 f"归一化 mean={EMNIST_MEAN:.4f}, std={EMNIST_STD:.4f}"),
     )
     log.kv(
         "DataLoader 设置",
         [
-            ("num_workers", str(config.num_workers)),
-            ("pin_memory", "True"),
-            ("drop_last", "训练集 True / 其余 False"),
+            ("num_workers", str(loader["num_workers"])),
+            ("pin_memory", str(loader["pin_memory"])),
+            ("persistent_workers", str(loader["persistent_workers"])),
+            ("drop_last", f"训练集 {loader['drop_last'][0]} / 验证、测试 {loader['drop_last'][1]}"),
             ("一个 epoch 的 step 数", str(stats['steps_per_epoch'])),
             ("总训练步数", f"{stats['steps_per_epoch'] * config.epochs:,}"),
         ],
@@ -259,15 +281,16 @@ class WideResNetBlock(nn.Module):
 
 
 class WideResNetMNIST(nn.Module):
-    def __init__(self, widen_factor: int = 2):
+    def __init__(self, widen_factor: int = 2, num_classes: int = 10):
         super().__init__()
         n = 32 * widen_factor
+        self.num_classes = num_classes
         self.conv1 = nn.Conv2d(1, n, 3, 1, 1)
         self.layer1 = WideResNetBlock(n, n)
         self.layer2 = WideResNetBlock(n, n * 2, stride=2)
         self.layer3 = WideResNetBlock(n * 2, n * 4, stride=2)
         self.pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Linear(n * 4, 10)
+        self.fc = nn.Linear(n * 4, num_classes)
 
     def forward(self, x):
         x = F.relu(self.conv1(x), inplace=True)
@@ -578,7 +601,16 @@ def log_test_results(model, best_val, test_loader, device, log: LogManager,
     ])
 
     # ---- 逐类别准确率 ----
-    num_classes = 10
+    # 类别数从模型读取（兼容被 DataParallel 包裹的情况），避免与网络定义脱节
+    unwrapped = getattr(model, "module", model)
+    model_classes = getattr(unwrapped, "num_classes", None) or unwrapped.fc.out_features
+    label_classes = int(targets.max().item()) + 1 if targets.numel() else 0
+    if label_classes > model_classes:
+        log.warning(
+            f"标签最大值 {label_classes - 1} 超出模型输出维度 {model_classes}，"
+            "混淆矩阵将按标签范围扩展，请检查 num_classes 配置。"
+        )
+    num_classes = max(model_classes, label_classes)
     confusion = torch.zeros(num_classes, num_classes, dtype=torch.long)
     for target, pred in zip(targets.tolist(), preds.tolist()):
         confusion[target, pred] += 1
@@ -650,16 +682,19 @@ def main() -> int:
 
     log.section("模型结构")
     log.info("用一个模板模型统计各子模块的形状与参数分布（不计入训练）。")
-    template = WideResNetMNIST(widen_factor=config.widen_factor).to(device)
+    template = WideResNetMNIST(widen_factor=config.widen_factor,
+                              num_classes=config.num_classes).to(device)
     model_summary(log, template, (1, 1, 28, 28),
-                  title=f"WideResNetMNIST(widen_factor={config.widen_factor})")
+                  title=f"WideResNetMNIST(widen_factor={config.widen_factor}, "
+                        f"num_classes={config.num_classes})")
     del template
     if device.type == 'cuda':
         torch.cuda.empty_cache()
 
     log.section("模型训练")
     set_seed(config.seed)  # 再次固定种子，保证模型初始化可复现
-    model = WideResNetMNIST(widen_factor=config.widen_factor).to(device)
+    model = WideResNetMNIST(widen_factor=config.widen_factor,
+                            num_classes=config.num_classes).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     log.info(
         f"模型已创建 · 参数量 [accent]{fmt_params(n_params)}[/] · "
@@ -673,7 +708,8 @@ def main() -> int:
     log.success(f"训练完成 · 最优验证准确率 {fmt_pct(best_val)} · 耗时 {fmt_duration(train_secs)}")
 
     os.makedirs(config.checkpoint_dir, exist_ok=True)
-    ckpt_path = os.path.join(config.checkpoint_dir, "wrn_mnist.pt")
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    ckpt_path = os.path.join(config.checkpoint_dir, f"wrn_mnist_{timestamp}.pt")
     torch.save(model.state_dict(), ckpt_path)
     log.debug(f"已保存 {ckpt_path} · {fmt_bytes(os.path.getsize(ckpt_path))}")
     log.success(f"模型权重已保存至 [accent]{ckpt_path}[/]")
@@ -688,7 +724,8 @@ def main() -> int:
             ("总耗时", fmt_duration(log.elapsed)),
             ("测试准确率", f"[metric]{fmt_pct(results['test_acc'])}[/]"),
             ("最优验证准确率", f"{fmt_pct(best_val)}（epoch {best_record['epoch']}）"),
-            ("模型", f"WideResNetMNIST(widen_factor={config.widen_factor}) · {fmt_params(n_params)} 参数"),
+            ("模型", f"WideResNetMNIST(widen_factor={config.widen_factor}, "
+                    f"num_classes={config.num_classes}) · {fmt_params(n_params)} 参数"),
             ("训练耗时", f"{fmt_duration(train_secs)} · 平均 "
                         f"{fmt_duration(train_secs / max(1, len(history)))}/epoch"),
             ("检查点", ckpt_path),
